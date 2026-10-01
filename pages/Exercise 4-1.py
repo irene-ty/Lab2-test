@@ -417,25 +417,50 @@ def index_signature():
     return f"{EMBEDDING_MODEL}:{chunk_tokens}:{overlap_tokens}:v2"
 
 
-def source_is_current(source, file_hash, signature):
+def source_is_current(
+    source,
+    file_hash,
+    signature,
+    expected_chunk_count,
+):
+    """Confirm that every expected chunk exists and belongs to this version."""
+    if expected_chunk_count <= 0:
+        return False
+
     existing = collection.get(
         where={"source": source},
-        limit=1,
         include=["metadatas"],
     )
-    if not existing.get("metadatas"):
-        return False
-    metadata = existing["metadatas"][0]
-    return (
-        metadata.get("file_hash") == file_hash
-        and metadata.get("index_signature") == signature
-    )
 
+    metadatas = existing.get("metadatas") or []
+
+    if len(metadatas) != expected_chunk_count:
+        return False
+
+    try:
+        actual_indices = {
+            int(metadata["chunk_index"])
+            for metadata in metadatas
+        }
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    expected_indices = set(range(expected_chunk_count))
+
+    return (
+        actual_indices == expected_indices
+        and all(
+            metadata.get("file_hash") == file_hash
+            and metadata.get("index_signature") == signature
+            and int(metadata.get("expected_chunk_count", -1))
+            == expected_chunk_count
+            for metadata in metadatas
+        )
+    )
 
 def index_documents(paths, force=False):
     signature = index_signature()
-    prepared = []
-    changed_sources = set()
+    prepared_by_source = {}
     skipped_files = 0
     failed_files = []
 
@@ -443,77 +468,272 @@ def index_documents(paths, force=False):
     preparation_status = st.empty()
 
     for position, path in enumerate(paths, start=1):
-        preparation_status.write(f"Preparing {position}/{len(paths)}: {path.name}")
+        preparation_status.write(
+            f"Preparing {position}/{len(paths)}: {path.name}"
+        )
+
         try:
             text = read_document(path)
-            file_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            file_hash = hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest()
             source = str(path.relative_to(ROOT_DIR))
 
-            if not force and source_is_current(source, file_hash, signature):
-                skipped_files += 1
-                preparation_progress.progress(position / len(paths))
+            # Chunk before checking freshness so that the expected number
+            # of chunks can be verified.
+            chunks = chunk_document(
+                text,
+                chunk_tokens,
+                overlap_tokens,
+            )
+            expected_chunk_count = len(chunks)
+
+            if expected_chunk_count == 0:
+                failed_files.append(
+                    f"{path}: document contained no indexable text"
+                )
                 continue
 
-            metadata = extract_metadata(path, text, file_hash)
-            metadata["index_signature"] = signature
-            metadata["indexed_at"] = datetime.now(timezone.utc).isoformat()
+            if (
+                not force
+                and source_is_current(
+                    source,
+                    file_hash,
+                    signature,
+                    expected_chunk_count,
+                )
+            ):
+                skipped_files += 1
+                continue
 
-            chunks = chunk_document(text, chunk_tokens, overlap_tokens)
-            changed_sources.add(source)
+            metadata = extract_metadata(
+                path,
+                text,
+                file_hash,
+            )
+            metadata["index_signature"] = signature
+            metadata["expected_chunk_count"] = expected_chunk_count
+            metadata["indexed_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            source_items = []
 
             for chunk_index, chunk in enumerate(chunks):
-                chunk_metadata = {**metadata, "chunk_index": chunk_index}
-                prepared.append(
+                chunk_metadata = {
+                    **metadata,
+                    "chunk_index": chunk_index,
+                }
+
+                source_items.append(
                     {
-                        "id": stable_chunk_id(source, chunk_index),
+                        "id": stable_chunk_id(
+                            source,
+                            chunk_index,
+                        ),
                         "document": chunk,
-                        "embedding_text": embedding_text(chunk, chunk_metadata),
+                        "embedding_text": embedding_text(
+                            chunk,
+                            chunk_metadata,
+                        ),
                         "metadata": chunk_metadata,
                     }
                 )
+
+            prepared_by_source[source] = {
+                "items": source_items,
+                "file_hash": file_hash,
+                "expected_chunk_count": expected_chunk_count,
+            }
+
         except Exception as error:
             failed_files.append(f"{path}: {error}")
 
-        preparation_progress.progress(position / len(paths))
+        finally:
+            preparation_progress.progress(
+                position / len(paths)
+            )
 
     preparation_status.empty()
     preparation_progress.empty()
 
-    for source in changed_sources:
-        collection.delete(where={"source": source})
+    total_chunks = sum(
+        len(source_data["items"])
+        for source_data in prepared_by_source.values()
+    )
+
+    if total_chunks == 0:
+        return {
+            "files_selected": len(paths),
+            "files_updated": 0,
+            "files_skipped": skipped_files,
+            "chunks_written": 0,
+            "failures": failed_files,
+        }
 
     batch_size = 50
-    embedding_progress = st.progress(0) if prepared else None
-    embedding_status = st.empty() if prepared else None
+    completed_embedding_chunks = 0
+    updated_files = 0
+    chunks_written = 0
 
-    for start in range(0, len(prepared), batch_size):
-        batch = prepared[start : start + batch_size]
-        embedding_status.write(
-            f"Embedding chunks {start + 1}–"
-            f"{min(start + batch_size, len(prepared))} of {len(prepared)}"
-        )
-        embeddings = create_embeddings(
-            [item["embedding_text"] for item in batch]
-        )
-        collection.upsert(
-            ids=[item["id"] for item in batch],
-            documents=[item["document"] for item in batch],
-            embeddings=embeddings,
-            metadatas=[item["metadata"] for item in batch],
-        )
-        embedding_progress.progress(
-            min(start + batch_size, len(prepared)) / len(prepared)
-        )
+    embedding_progress = st.progress(0)
+    embedding_status = st.empty()
 
-    if embedding_status:
-        embedding_status.empty()
-        embedding_progress.empty()
+    for source, source_data in prepared_by_source.items():
+        items = source_data["items"]
+        file_hash = source_data["file_hash"]
+        expected_chunk_count = source_data[
+            "expected_chunk_count"
+        ]
+
+        try:
+            # Generate all embeddings for this source before deleting
+            # its old index.
+            source_embeddings = []
+
+            for start in range(0, len(items), batch_size):
+                batch = items[start : start + batch_size]
+
+                embedding_status.write(
+                    f"Embedding {source}: chunks "
+                    f"{start + 1}–"
+                    f"{min(start + batch_size, len(items))} "
+                    f"of {len(items)}"
+                )
+
+                batch_embeddings = create_embeddings(
+                    [
+                        item["embedding_text"]
+                        for item in batch
+                    ]
+                )
+
+                if len(batch_embeddings) != len(batch):
+                    raise RuntimeError(
+                        "Embedding response count did not match "
+                        "the requested chunk count."
+                    )
+
+                source_embeddings.extend(batch_embeddings)
+                completed_embedding_chunks += len(batch)
+
+                embedding_progress.progress(
+                    completed_embedding_chunks
+                    / total_chunks
+                )
+
+            # Save the previous source data so it can be restored if
+            # writing the replacement index fails.
+            previous = collection.get(
+                where={"source": source},
+                include=[
+                    "documents",
+                    "metadatas",
+                    "embeddings",
+                ],
+            )
+
+            previous_ids = previous.get("ids") or []
+            previous_documents = (
+                previous.get("documents") or []
+            )
+            previous_metadatas = (
+                previous.get("metadatas") or []
+            )
+            previous_embeddings = previous.get("embeddings")
+
+            try:
+                collection.delete(
+                    where={"source": source}
+                )
+
+                for start in range(
+                    0,
+                    len(items),
+                    batch_size,
+                ):
+                    end = start + batch_size
+                    batch = items[start:end]
+
+                    collection.upsert(
+                        ids=[
+                            item["id"]
+                            for item in batch
+                        ],
+                        documents=[
+                            item["document"]
+                            for item in batch
+                        ],
+                        embeddings=source_embeddings[start:end],
+                        metadatas=[
+                            item["metadata"]
+                            for item in batch
+                        ],
+                    )
+
+                # Verify the finished index before marking it complete.
+                if not source_is_current(
+                    source,
+                    file_hash,
+                    signature,
+                    expected_chunk_count,
+                ):
+                    raise RuntimeError(
+                        "Index verification failed after writing."
+                    )
+
+            except Exception as write_error:
+                # Remove any partially written replacement.
+                collection.delete(
+                    where={"source": source}
+                )
+
+                # Restore the previous version when one existed.
+                if previous_ids:
+                    for start in range(
+                        0,
+                        len(previous_ids),
+                        batch_size,
+                    ):
+                        end = start + batch_size
+
+                        restore_arguments = {
+                            "ids": previous_ids[start:end],
+                            "documents": (
+                                previous_documents[start:end]
+                            ),
+                            "metadatas": (
+                                previous_metadatas[start:end]
+                            ),
+                        }
+
+                        if previous_embeddings is not None:
+                            restore_arguments["embeddings"] = (
+                                previous_embeddings[start:end]
+                            )
+
+                        collection.upsert(
+                            **restore_arguments
+                        )
+
+                raise write_error
+
+            updated_files += 1
+            chunks_written += len(items)
+
+        except Exception as error:
+            failed_files.append(
+                f"{source}: {error}"
+            )
+
+    embedding_status.empty()
+    embedding_progress.empty()
 
     return {
         "files_selected": len(paths),
-        "files_updated": len(changed_sources),
+        "files_updated": updated_files,
         "files_skipped": skipped_files,
-        "chunks_written": len(prepared),
+        "chunks_written": chunks_written,
         "failures": failed_files,
     }
 
